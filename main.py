@@ -1,11 +1,13 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
 import pandas as pd
+from fastapi import FastAPI, UploadFile, File, HTTPException
 import requests
 import json
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.engine import URL
 from dotenv import load_dotenv
 import os
+import re
 
 load_dotenv()
 
@@ -27,6 +29,13 @@ API_URL = os.getenv("API_URL")
 TOKEN = os.getenv("DVARA_TOKEN")
 
 
+def validate_table_name(table_name: str) -> str:
+    """Allow only safe MySQL table names."""
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", table_name):
+        raise HTTPException(status_code=400, detail="Invalid table_name")
+    return table_name
+
+
 def create_table_if_not_exists(table_name):
     """Create table if it doesn't exist"""
     try:
@@ -46,9 +55,9 @@ def create_table_if_not_exists(table_name):
             conn.execute(text(create_table_query))
             conn.commit()
 
-        print(f"✅ Table '{table_name}' ready")
+        print(f"Table '{table_name}' ready")
     except Exception as e:
-        print(f"⚠️ Could not create table: {e}")
+        print(f"Could not create table: {e}")
 
 
 def get_database_fields(table_name):
@@ -61,7 +70,7 @@ def get_database_fields(table_name):
             fields = [row[0] for row in result if row[0] != 'created_at']
             return fields
     except Exception as e:
-        print(f"⚠️ Could not fetch database fields: {e}")
+        print(f"Could not fetch database fields: {e}")
         return [
             "client_id",
             "full_name",
@@ -82,7 +91,7 @@ def call_llm(excel_columns, database_fields):
 
     task_json_string = json.dumps(task_data)
 
-    print("📤 Sending to LLM (form-data):")
+    print("Sending to LLM (form-data):")
     print(f"   task = {task_json_string}")
 
     form_data = {
@@ -107,7 +116,7 @@ def call_llm(excel_columns, database_fields):
         response.raise_for_status()
 
         result = response.json()
-        print("📥 Full API Response:", json.dumps(result, indent=2))
+        print("Full API Response:", json.dumps(result, indent=2))
 
         if result.get("status") != "completed":
             error_msg = result.get("error", "Unknown error")
@@ -142,18 +151,24 @@ async def upload_excel(
     """Upload Excel and map fields automatically"""
 
     try:
+        table_name = validate_table_name(table_name)
         df = pd.read_excel(file.file)
+        if df.empty:
+            raise HTTPException(status_code=400, detail="Uploaded file has no data rows")
+
+        # Normalize incoming Excel headers so fixed mapping works for case/spacing differences.
+        df.columns = [str(col).strip().lower() for col in df.columns]
         excel_columns = df.columns.tolist()
 
         print(f" Excel Columns: {excel_columns}")
         print(f" Total Rows: {len(df)}")
 
         database_fields = get_database_fields(table_name)
-        print(f"🗄️ Database Fields: {database_fields}")
+        print(f"Database Fields: {database_fields}")
 
         mapping = call_llm(excel_columns, database_fields)
 
-        # 🔒 FIXED COLUMN MAPPING (PRIORITY OVER LLM)
+        # Fixed column mapping (priority over LLM)
         FIXED_COLUMN_MAPPING = {
             "loaner_id": "client_id",
             "name": "full_name",
@@ -164,12 +179,13 @@ async def upload_excel(
         }
 
         final_mapping = {}
+        llm_mapping_lower = {str(k).strip().lower(): v for k, v in mapping.items()}
 
         for excel_col in df.columns:
             if excel_col in FIXED_COLUMN_MAPPING:
                 final_mapping[excel_col] = FIXED_COLUMN_MAPPING[excel_col]
-            elif excel_col in mapping:
-                final_mapping[excel_col] = mapping[excel_col]
+            elif excel_col in llm_mapping_lower:
+                final_mapping[excel_col] = llm_mapping_lower[excel_col]
 
         df.rename(columns=final_mapping, inplace=True)
 
@@ -177,8 +193,39 @@ async def upload_excel(
         df = df[[col for col in df.columns if col in allowed_columns]]
 
         rows_inserted = 0
+        rows_skipped_existing = 0
+        rows_dropped_invalid = 0
         if insert_to_db:
-            df.to_sql(table_name, engine, if_exists="append", index=False)
+            if "client_id" not in df.columns:
+                raise HTTPException(status_code=400, detail="Mapped data must include 'client_id' to insert")
+
+            before_clean_count = len(df)
+            df["client_id"] = df["client_id"].astype(str).str.strip()
+            df = df[df["client_id"].notna() & (df["client_id"] != "")]
+            df = df.drop_duplicates(subset=["client_id"], keep="last")
+            rows_dropped_invalid = before_clean_count - len(df)
+
+            if df.empty:
+                raise HTTPException(status_code=400, detail="No valid rows left to insert after cleaning")
+
+            # Skip rows that already exist, so re-uploads don't fail on PK collisions.
+            incoming_ids = df["client_id"].tolist()
+            if incoming_ids:
+                with engine.connect() as conn:
+                    bind_params = {f"id{i}": value for i, value in enumerate(incoming_ids)}
+                    placeholders = ", ".join(f":id{i}" for i in range(len(incoming_ids)))
+                    existing_query = text(
+                        f"SELECT client_id FROM {table_name} WHERE client_id IN ({placeholders})"
+                    )
+                    existing_ids = {row[0] for row in conn.execute(existing_query, bind_params)}
+
+                if existing_ids:
+                    before_existing_filter = len(df)
+                    df = df[~df["client_id"].isin(existing_ids)]
+                    rows_skipped_existing = before_existing_filter - len(df)
+
+            if not df.empty:
+                df.to_sql(table_name, engine, if_exists="append", index=False)
             rows_inserted = len(df)
 
         return {
@@ -189,11 +236,17 @@ async def upload_excel(
             "renamed_columns": df.columns.tolist(),
             "total_rows": len(df),
             "rows_inserted": rows_inserted,
+            "rows_skipped_existing": rows_skipped_existing,
+            "rows_dropped_invalid": rows_dropped_invalid,
             "preview": df.head(5).to_dict("records")
         }
 
     except HTTPException:
         raise
+    except IntegrityError as e:
+        raise HTTPException(status_code=409, detail=f"Database integrity error: {str(e.orig)}")
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
