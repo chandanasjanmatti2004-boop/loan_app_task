@@ -1,0 +1,14 @@
+
+## pip install -r requirements.txt
+
+
+fastapi
+uvicorn
+pandas
+requests
+sqlalchemy
+pymysql
+python-dotenv
+openpyxl
+python-multipart
+
